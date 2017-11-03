@@ -1,0 +1,37 @@
+#!/bin/bash
+
+PAGEGRAB_SCRIPT=/cesr/tw/mail/scripts/pagegrab.js
+DEST_DIR=/tw/mailgrabs
+
+CASPER=/cesr/tw/casperjs/casperjs-git/bin/casperjs
+
+if [[ "$#" -ne 2 ]]; then
+    echo "Usage: $0 http[s]://URL IDENTIFIER" >&2
+    exit 1
+fi
+
+URL=${1}
+ID=${2}
+#SITE=${URL//http*:\/\/}
+DATE=$(date "+%y%m%d")
+TIME=$(date "+%H%M%S")
+#LETTER=${SITE:0:1}
+OUTPATH=$DEST_DIR/$DATE/$TIME/$ID
+OUTPREFIX=$OUTPATH/$ID
+
+mkdir -p $OUTPREFIX
+chmod -R 777 $DEST_DIR 2> /dev/null
+
+echo "Started at "$(date "+%y-%m-%d %H:%M:%S") > $OUTPREFIX.out
+echo "Path before modification: $PATH" >> $OUTPREFIX.out
+export PATH=$PATH:/usr/local/bin
+$CASPER --proxy=$PROXY_SERVER --proxy-type=http \
+    --ignore-ssl-errors=true --ssl-protocol=any \
+    $PAGEGRAB_SCRIPT $URL $OUTPREFIX >> $OUTPREFIX.out 2> $OUTPREFIX.err
+retVal=$?
+echo "================" >> $OUTPREFIX.out
+echo "Return Value: $retVal" >> $OUTPREFIX.out
+echo "Finished at "$(date "+%y-%m-%d %H:%M:%S") >> $OUTPREFIX.out
+
+echo $OUTPATH
+exit $retVal

@@ -1,0 +1,69 @@
+#!/usr/bin/python
+
+import asyncore
+import socket
+import sys, os, select
+import termios, atexit, subprocess
+
+def toggle_echo(fd, enabled):
+    (iflag, oflag, cflag, lflag, ispeed, ospeed, cc) = termios.tcgetattr(fd)
+    if enabled:
+        lflag |= termios.ECHO
+    else:
+        lflag &= ~termios.ECHO
+    new_attr = [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
+    termios.tcsetattr(fd, termios.TCSANOW, new_attr)
+
+class PromptHandler(asyncore.dispatcher_with_send):
+    def handle_read(self):
+        data = self.recv(8192)
+        if data:
+            parts = data.split(' ', 1)
+            #print repr(parts)
+
+            if len(parts[0]) > 0:
+                subprocess.Popen(["eog", parts[0]], 0, None, subprocess.PIPE,
+                                 subprocess.PIPE, subprocess.PIPE)
+
+            # Read in any incidental input first
+            while len(select.select([sys.stdin.fileno()], [], [], 0.0)[0]) > 0:
+                os.read(sys.stdin.fileno(), 4096)
+
+            # Toggle echo long enough to read an input
+            toggle_echo(sys.stdin.fileno(), True)
+            self.send(raw_input(parts[1].rstrip() + " > ") + "\n")
+            toggle_echo(sys.stdin.fileno(), False)
+
+class PromptServer(asyncore.dispatcher):
+
+    def __init__(self, host, port):
+        asyncore.dispatcher.__init__(self)
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        try:
+            self.bind((host, port))
+        except:
+            raise
+        self.listen(5)
+        toggle_echo(sys.stdin.fileno(), False)
+        atexit.register(toggle_echo, sys.stdin.fileno(), True)
+
+    def handle_accept(self):
+        pair = self.accept()
+        if pair is not None:
+            sock, addr = pair
+            #print 'Incoming connection from %s' % repr(addr)
+            handler = PromptHandler(sock)
+
+try:
+    server = PromptServer('localhost', 5080)
+except socket.error as e:
+    code,msg = e
+    sys.stderr.write("ERROR: " + msg + "\n")
+    sys.exit(code)
+
+try:
+    asyncore.loop()
+except KeyboardInterrupt:
+    sys.exit()
+

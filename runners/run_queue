@@ -1,0 +1,14 @@
+#!/bin/bash
+
+LOG_DIR=/cesr/tw/logs/queue_logs
+
+rv=100
+while [[ "$rv" -eq 100 ]]; do
+    ./run_queue_nowrap $@ &
+    pid=$!
+    trap "kill -INT $pid" SIGINT SIGTERM
+    wait $pid
+    rv=$?
+    echo "Exited with $rv"
+done
+exit $rv

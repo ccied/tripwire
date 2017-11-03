@@ -1,0 +1,46 @@
+#!/usr/bin/python
+
+HEARTBEAT_NAME   = "mail-poller"
+
+DB_NAME          = ""  # BLANKED
+DB_USER          = ""  # BLANKED
+DB_HOST          = ""  # BLANKED
+DB_PASS          = ""  # BLANKED
+
+PUB_CHANNEL      = "tw:event:manual_check"
+SLEEP_TIME       = 2  # In seconds
+
+COMPROMISED_USER_QUERY = ("SELECT username FROM identities WHERE"
+                          " iid in (SELECT DISTINCT iid FROM login_info_v2)")
+
+import os
+import psycopg2
+import psycopg2.extras
+import redbeat
+import redis
+import socket
+import time
+
+
+def main():
+    redbeat.start_redbeat(
+        HEARTBEAT_NAME, "{}/{}".format(socket.gethostname(), os.getpid()))
+
+    conn = psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER, host=DB_HOST, password=DB_PASS)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    redis_conn = redis.Redis()
+
+    cur.execute(COMPROMISED_USER_QUERY)
+    users = cur.fetchall()
+
+    for (user,) in users:
+        time.sleep(SLEEP_TIME)
+        redis_conn.publish(PUB_CHANNEL, user)
+        print user
+
+
+if __name__ == '__main__':
+    main()
+

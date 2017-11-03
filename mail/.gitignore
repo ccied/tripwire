@@ -1,0 +1,10 @@
+.vim*
+.ssh/
+*.pyc
+logs
+.git-old
+mailgrabs
+messages
+tunnel-user
+tw-user
+tools

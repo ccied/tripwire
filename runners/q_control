@@ -1,0 +1,40 @@
+#!/usr/bin/python
+"""Publish commands to the queues.
+
+Examples might be 'pause', 'unpause', 'exit'
+"""
+
+import redis
+import sys
+
+
+CTRL_CHNL = "tw:event:queue_control"
+CTRL_LOCAL_CHNL = "tw:event:local_queue_control:"
+
+
+def main():
+    if not sys.argv[1:]:
+        sys.stderr.write("USAGE: {} (node_id|'all') cmd\n".format(sys.argv[0]))
+        return 1
+
+    if len(sys.argv) < 3:
+        print len(sys.argv)
+        sys.stderr.write("Invalid operation.\n")
+        return 1
+
+    target = sys.argv[1]
+    command = " ".join(sys.argv[2:])
+
+    if target == "all":
+        channel = CTRL_CHNL
+    else:
+        channel = CTRL_LOCAL_CHNL + target
+
+    rc = redis.Redis()
+    rc.publish(channel, command)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+

@@ -1,0 +1,323 @@
+#!/usr/bin/php
+<?php
+define("PATH_TO_API", "/cesr/tw/de-captcher/api_php/api");
+set_include_path(PATH_TO_API . ":" . get_include_path());
+require( 'ccproto_client.php' );
+#require( '../api/ccproto_client.php' );
+
+// your connect information
+define( 'HOST',        "api.de-captcher.com"    );    // YOUR HOST
+define( 'PORT',        5015);    // YOUR PORT
+
+// TODO
+define( 'USERNAME',    "");    // YOUR LOGIN
+// TODO
+define( 'PASSWORD',    "");    // YOUR PASSWORD
+
+define( 'PIC_FILE_NAME',    "pic.jpg"    );
+
+define("METHOD_INVALID",   -1);
+define("METHOD_TEXT",       1);
+define("METHOD_IMAGE",      2);
+define("METHOD_CORRECTION", 3);
+define("METHOD_BALANCE",    4);
+
+define("LOG_FILE", "/tmp/testlog");
+
+function logger($txt) {
+    $log = fopen(LOG_FILE, 'a');
+    fwrite($log, $txt);
+    fclose($log);
+}
+
+function logQuestion($question, $response, $majorid, $minorid) {
+    $date = date("c");
+    logger("$date: \"$question\" -> \"$response\" $majorid/$minorid\n");
+}
+
+function logCorrection($majorid, $minorid) {
+    $date = date("c");
+    logger("$date: Sent correction for $majorid/$minorid\n");
+}
+
+function getBalance($ccp) {
+    $balance = 0;
+    if( $ccp->balance( $balance ) != ccERR_OK )
+        return NULL;
+    return $balance;
+}
+
+function getMethod($strmethod) {
+    switch ( strtoupper($strmethod) ) {
+    case "TXT":
+        return METHOD_TEXT;
+    case "IMG":
+        return METHOD_IMAGE;
+    case "DEL":
+        return METHOD_CORRECTION;
+    case "BAL":
+        return METHOD_BALANCE;
+    }
+    return METHOD_INVALID;
+}
+
+function getErrDesc($err) {
+    switch( $err ) {
+        // most common return codes
+    case ccERR_OK:
+        return "No error";
+    case ccERR_BALANCE:
+        return "Insufficient funds";
+    case ccERR_TIMEOUT:
+        return "Server timeout";
+        //print( "picture has been timed out on server (payment not taken)" );
+    case ccERR_OVERLOAD:
+        return "Server overloaded";
+    case ccERR_STATUS:
+        return "Local error";
+            //print( " either ccproto_init() or ccproto_login() has not been successfully called prior to ccproto_picture()" );
+            //print( " need ccproto_init() and ccproto_login() to be called" );
+
+    // network errors
+    case ccERR_NET_ERROR:
+        return "Network error"; //call ccproto_login() again
+
+    // server-side errors
+    case ccERR_TEXT_SIZE:
+        return "Size of the text returned is too big";
+    case ccERR_GENERAL:
+        //print( "server-side error, better to call ccproto_login() again" );
+        return "Server side error";
+    case ccERR_UNKNOWN:
+    default:
+        return "Unknown error";
+        //" unknown error, better to call ccproto_login() again"
+    }
+
+}
+
+function askFromImage($ccp, $imgpath, &$response, &$majID, &$minID) {
+    $text = '';
+    $pict_to    = ptoDEFAULT;
+    $pict_type  = ptUNSPECIFIED;
+    $pict = file_get_contents( $imgpath );
+
+    $res = $ccp->picture2( $pict, $pict_to, $pict_type, $text, $majID, $minID );
+    if ($res !== 0) {
+        $response = getErrDesc($res);
+        return false;
+    }
+
+    $response = $text;
+    return true;
+}
+
+function askFromQuestion($ccp, $question, &$response, &$majID, &$minID) {
+    $text = '';
+    $pict_to    = ptoDEFAULT;
+    $pict_type    = ptTEXT;
+
+    $res = $ccp->picture2( $question, $pict_to, $pict_type, $text, $majID, $minID );
+    if ($res !== 0) {
+        $response = getErrDesc($res);
+        return false;
+    }
+
+    $response = $text;
+    return true;
+}
+
+function ask($ccp, $method, $question, &$response, &$majID, &$minID) {
+    switch ($method) {
+    case METHOD_TEXT:
+        return askFromQuestion($ccp, $question, $response, $majID, $minID);
+    case METHOD_IMAGE:
+        return askFromImage($ccp, $question, $response, $majID, $minID);
+    default:
+        $response = "Invalid method";
+        return false;
+    }
+}
+
+function best2of3($ccp, $method, $question, &$response) {
+    $responses = array("", "", "");
+    $majorids  = array(0,0,0);
+    $minorids  = array(0,0,0);
+
+    $res1 = ask($ccp, $method, $question, $responses[0], $majorids[0], $minorids[0]);
+    $res2 = ask($ccp, $method, $question, $responses[1], $majorids[1], $minorids[1]);
+
+    // If they agree on the outcome, then we can just pass it along.
+    if ($res1 == $res2 && $responses[0] == $responses[1]) {
+        $response = $responses[0];
+        return $res1;
+    }
+
+    $res3 = ask($ccp, $method, $question, $responses[2], $majorids[2], $minorids[2]);
+
+    // If we agree with the first one, great.
+    if ($res1 == $res3 && $responses[0] == $responses[2]) {
+        $response = $responses[2];
+
+        if ($res1 && $res2)
+            $ccp->picture_bad2( $majorids[1], $minorids[1] );
+
+        return $res3;
+    }
+
+    // If we agree with the second one, great.
+    if ($res2 == $res3 && $responses[1] == $responses[2]) {
+        $response = $responses[2];
+
+        if ($res2 && $res3)
+            $ccp->picture_bad2( $majorids[0], $minorids[0] );
+
+        return $res3;
+    }
+
+    // Otherwise lets just hope one of the successes was right
+    if ($res1) {
+        $response = $responses[0];
+        return true;
+    }
+    if ($res2) {
+        $response = $responses[1];
+        return true;
+    }
+    if ($res3) {
+        $response = $responses[2];
+        return true;
+    }
+
+    // Unless there weren't any successes
+    $response = "No success";
+    return false;
+}
+
+
+function getProtocolObject() {
+    $ccp = new ccproto();
+    $ccp->init();
+
+    //print( "Logging in..." );
+    if( $ccp->login( HOST, PORT, USERNAME, PASSWORD ) < 0 ) {
+        //print( " FAILED\n" );
+        return NULL;
+    } else {
+        //print( " OK\n" );
+    }
+
+    /*
+    $system_load = 0;
+    if( $ccp->system_load( $system_load ) != ccERR_OK ) {
+        print( "system_load() FAILED\n" );
+        return NULL;
+    }
+    print( "System load=".$system_load." perc\n" );
+
+    $balance = 0;
+    if( $ccp->balance( $balance ) != ccERR_OK ) {
+        print( "balance() FAILED\n" );
+        return NULL;
+    }
+    print( "Balance=".$balance."\n" );
+    */
+
+    return $ccp;
+}
+
+function stderr($str) {
+    $stderr = fopen('php://stderr', 'w');
+    fwrite($stderr, $str);
+    fclose($stderr);
+}
+
+
+function usage($err = NULL) {
+    $name = $_SERVER['argv'][0];
+
+    $resp = '';
+    if ($err !== NULL)
+        $resp .= "ERROR: " . $err . "\n\n";
+
+    $resp .= "USAGE: \n" .
+        "\t$name TXT QUESTION\n" .
+        "\t$name IMG PATH\n" . 
+        "\t$name DEL MAJORID MINORID\n" . 
+        "\t$name BAL\n";
+
+    stderr($resp);
+
+    exit(1);
+}
+
+if (!isset($_SERVER['argv']))
+    die("CLI-only");
+
+if (count($_SERVER['argv']) <= 1)
+    usage("More arguments required");
+
+$argv = $_SERVER['argv'];
+
+$method = getMethod($argv[1]);
+
+if ($method == METHOD_INVALID)
+    usage("Invalid mode");
+
+$ccp = getProtocolObject();
+
+if ($ccp === NULL) {
+    stderr("ERROR: Bad ccp.\n");
+    exit(1);
+}
+
+switch ($method) {
+
+case METHOD_IMAGE:
+case METHOD_TEXT:
+    if (count($argv) <= 2)
+        usage("More arguments required for image/text question");
+
+    //unset($argv[0]);
+    //$question = implode(" ", $argv);
+    $question = $argv[2];
+
+    $majorid = $minorid = 0;
+    $response = "";
+    $res = ask($ccp, $method, $question, $response, $majorid, $minorid);
+
+    //echo "IDs: $majorid/$minorid\n";
+
+    logQuestion($question, $response, $majorid, $minorid);
+
+    if (!$res) {
+        stderr("ERROR: " . $response . "\n");
+        exit(1);
+    }
+
+    echo $response . "\n";
+
+    break;
+
+case METHOD_CORRECTION:
+    if (count($argv) != 4)
+        usage("Major and minor IDs required for correction");
+
+    //print( "Pre-balance: " . getBalance($ccp) . "\n" );
+
+    $majorid = ($argv[2]);
+    $minorid = ($argv[3]);
+    $ccp->picture_bad2( $majorid, $minorid );
+
+    //print( "Post-balance: " . getBalance($ccp) . "\n" );
+    logCorrection($majorid, $minorid);
+    break;
+
+case METHOD_BALANCE:
+    print( "Balance: ".getBalance($ccp)."\n" );
+    break;
+}
+
+$ccp->close();
+
+?>

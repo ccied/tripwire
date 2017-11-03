@@ -1,0 +1,118 @@
+#!/usr/bin/python
+
+from collections import deque
+from multiprocessing.pool import ThreadPool
+import urllib2
+import redis
+import sched
+import signal
+import sys
+import time
+import redbeat
+
+# TODO - set me to the name of your proxy host
+PROXY_HOST = ""  # BLANKED
+
+# TODO - set me to the URL of a script that will report your apparent IP.
+TEST_URL = ""  # BLANKED
+
+# TODO - set me to a list of ports that run proxies
+PROXY_PORTS = ""  # BLANKED
+
+URL_OPEN_TIMEOUT = 1
+
+TIME_BETWEEN_MEASUREMENTS = 5
+RUNNING_HISTORY_LEN = 20
+
+HISTORY_REPORT_TTL  = 85  # Gives us 15 seconds extra to replace old data.
+HISTORY_REPORT_KEY  = "tw:proxies:fail_summary"
+
+FAIL_REPORT_KEY     = "tw:proxies:fail_report"
+
+# Hooray globals!
+history = deque([], RUNNING_HISTORY_LEN)
+exiting = False
+next_sched = None
+scheduler = None
+redis_conn = None
+
+
+def test_proxy(port):
+    proxy_support = urllib2.ProxyHandler(
+        {"http": "http://{}:{}".format(PROXY_HOST, port)})
+    opener = urllib2.build_opener(proxy_support)
+
+    try:
+        html = opener.open(TEST_URL, "", URL_OPEN_TIMEOUT).read()
+    except urllib2.URLError:
+        return False
+    except Exception:
+        #print type(e), e, port
+        return False
+
+    if html.strip():
+        return True
+
+    return False
+
+
+def just_bad(acc, x):
+    (port, success) = x
+    if not success:
+        acc.append(port)
+    return acc
+
+
+def get_proxy_pair(port):
+    return (port, test_proxy(port))
+
+
+def get_proxy_summary(pool):
+    return pool.map(get_proxy_pair, PROXY_PORTS)
+
+
+def scheduled_proxy_check(sc, pool, heart):
+    global next_sched
+    next_sched = sc.enter(
+        TIME_BETWEEN_MEASUREMENTS, 1, scheduled_proxy_check, (sc, pool, heart))
+
+    results = get_proxy_summary(pool)
+    bad_results = reduce(just_bad, results, [])
+    history.append(len(bad_results))
+
+    print time.time(), sum(history), bad_results
+
+    redis_conn.set(HISTORY_REPORT_KEY, sum(history))
+    redis_conn.expire(HISTORY_REPORT_KEY, HISTORY_REPORT_TTL)
+
+    redis_conn.publish(
+        FAIL_REPORT_KEY, ",".join([str(x) for x in bad_results]))
+    heart.set_data("{} failed".format(sum(history)))
+
+
+def set_exiting(_sig, _frame):
+    global exiting
+    exiting = True
+    if next_sched:
+        scheduler.cancel(next_sched)
+
+
+def main():
+    global next_sched, scheduler, redis_conn
+
+    redis_conn = redis.Redis()
+    signal.signal(signal.SIGINT, set_exiting)
+
+    heart = redbeat.start_redbeat("proxy_watch")
+
+    pool = ThreadPool(processes=16)        # start 4 worker processes
+
+    scheduler = sched.scheduler(time.time, time.sleep)
+    next_sched = scheduler.enter(
+        5, 1, scheduled_proxy_check, (scheduler, pool, heart))
+    scheduler.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

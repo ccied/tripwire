@@ -1,0 +1,251 @@
+#!/usr/bin/python
+
+HEARTBEAT_NAME      = "mail-checker"
+
+HANDLE_MAIL_PATH    = "/cesr/tw/mail/mailhandler"
+HOST                = ""  # BLANKED
+PORT                = 995
+
+RETRY_DELAY         = 120
+RETRY_MAX           = 5
+
+CH_REG_SUCCEED      = "tw:event:registration_created"
+CH_REG_TIMER        = "tw:event:reg_timer"
+CH_IDENTITY_POLL    = "tw:event:identity_poll"
+CH_MANUAL_CHECK     = "tw:event:manual_check"
+
+CHANNELS            = [CH_REG_SUCCEED,
+                       CH_REG_TIMER,
+                       CH_IDENTITY_POLL,
+                       CH_MANUAL_CHECK]
+
+USERNAME_CHANNELS   = [CH_MANUAL_CHECK]
+IID_CHANNELS        = [CH_IDENTITY_POLL]
+
+#CHECK_DELAYS        = [0, 2, 5, 10]
+CHECK_DELAYS        = [2 * 60, 12 * 60]
+
+import logging
+import os
+import poplib
+import redbeat
+import redis
+import socket
+import sys
+import traceback
+from threading import Timer
+
+sys.path.insert(0, HANDLE_MAIL_PATH)
+import handle_email
+
+
+def getMessages(user, passwd):
+    M = poplib.POP3_SSL(HOST, PORT)
+    M.user(user)
+    M.pass_(passwd)
+
+    msgs = []
+    numMessages = len(M.list()[1])
+    # Retrieve them all
+    for i in range(numMessages):
+        msg = "\n".join(M.retr(i + 1)[1])
+        msgs.append(msg)
+
+    # Delete them all
+    for i in range(numMessages):
+        M.dele(i + 1)
+
+    return msgs
+
+
+def usage():
+    sys.stderr.write("Usage: " + sys.argv[0] + " RID\n")
+    sys.exit(1)
+
+
+def querySingle():
+    #user    = raw_input("User: ")
+    #passwd  = getpass.getpass()
+
+    if len(sys.argv) != 2:
+        usage()
+
+    try:
+        rid = int(sys.argv[1])
+    except:
+        usage()
+
+    handler = handle_email.get_handler()
+
+    (user, passwd) = handler.get_up_from_rid(rid)
+
+    if user is None:
+        sys.exit(1)
+
+    msgs = getMessages(user, passwd)
+    for i in range(len(msgs)):
+        handler.accept_mail(msgs[i], user)
+
+
+def check_and_process_mail(handler, user, passwd, try_count=1, priority=3):
+    handler.log("debug", "POP check on {}.".format(user))
+    try:
+        msgs = getMessages(user, passwd)
+    except Exception as e:  # pylint: disable=broad-except
+        rep_e = repr(e)
+        if "AUTH012" in rep_e:
+            handler.log(
+                "error",
+                "Invalid user/pass combo for {}. Failing.".format(user))
+            return
+
+        delay_time = RETRY_DELAY
+
+        if "AUTH001" in rep_e:
+            handler.log(
+                "info",
+                "{} needs a break. Doubling normal backoff.".format(user))
+            delay_time *= 2
+
+        delay_time *= try_count
+
+        if try_count >= RETRY_MAX:
+            handler.log(
+                "info" if priority == 3 else "error",
+                "getMessages excepted {}x on {} with {}. Failing.".format(
+                    try_count, user, rep_e))
+            return
+
+        handler.log("info", "getMessages excepted on {} with {}. "
+                    "Will try again later.".format(user, rep_e))
+        timer = Timer(delay_time,
+                      check_and_process_mail,
+                      args=[handler, user, passwd, try_count + 1, priority])
+        timer.start()
+        return
+
+    found_message = False
+    for i in range(len(msgs)):
+        found_message = True
+        #backup_path = handle_email.backup_message(msgs[i], user)
+        try:
+            handler.accept_mail(msgs[i], user)
+            handler.commit()
+        except Exception as e:
+            handler.log(
+                "error",
+                "check_and_process_mail failed on msg to {} with {}.".format(
+                    user, repr(e)))
+            #"check_and_process_mail failed on msg to {} with {}. Msg at: {}"
+            #.format(
+            #           user, repr(e), backup_path))
+            handler.log("warning", traceback.format_exc())
+            raise
+
+    if not found_message:
+        handler.log("debug", "Found no mail for {}.".format(user))
+
+
+class CheckTimer(object):
+    def __init__(self, handler, user, passwd, check_type=None, priority=3):
+        self.handler = handler
+        self.user = user
+        self.passwd = passwd
+        self.priority = priority
+
+        delays = None
+        if not check_type or check_type == "delayed":
+            delays = CHECK_DELAYS
+        elif check_type == "immediate":
+            delays = [0]
+        else:
+            handler.log("error",
+                        "Received invalid check_type: {}".format(check_type))
+            return
+
+        for delay in delays:
+            timer = Timer(delay, self.checkMail, args=[delay])
+            timer.start()
+
+    def checkMail(self, delay):
+        logging.info("Checking mail for %s after %s second delay",
+                     self.user, delay)
+        check_and_process_mail(
+            self.handler, self.user, self.passwd, self.priority)
+
+
+def main():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+        datefmt='%m-%d %H:%M')
+
+    redbeat.start_redbeat(
+        HEARTBEAT_NAME, "{}/{}".format(socket.gethostname(), os.getpid()))
+
+    handler = handle_email.get_handler()
+
+    red = redis.Redis()
+    pubsub = red.pubsub()
+    pubsub.subscribe(CHANNELS)
+    for item in pubsub.listen():
+        if item['type'] != 'message':
+            continue
+
+        # Commit on the off-chance that we've got stale data, maybe.
+        handler.commit()
+
+        priority = 3
+
+        if item['channel'] in USERNAME_CHANNELS:
+            user = item['data'].strip()
+            passwd = handler.get_password(user)
+            logging.info("Received manual check for %s", user)
+            check_type = "immediate"
+            priority = 1
+
+        elif item['channel'] in IID_CHANNELS:
+            try:
+                iid = int(item['data'])
+            except:
+                handler.log("error",
+                            "Received malformed message to {}: {}".format(
+                                item['channel'], item['data']))
+                continue
+
+            (user, passwd) = handler.get_up_from_iid(iid)
+            logging.info("Received IID check for %s/%s", iid, user)
+            check_type = "immediate"
+
+        elif item['channel'] in CHANNELS:
+            try:
+                rid = int(item['data'])
+            except:
+                handler.log("error",
+                            "Received malformed message to {}: {}".format(
+                                item['channel'], item['data']))
+                continue
+
+            (user, passwd) = handler.get_up_from_rid(rid)
+            logging.info("Received check for rid {}, user {} from {}".format(
+                rid, user, item['channel']))
+            check_type = "delayed"
+            priority = 2
+
+        else:
+            logging.warning("Skipping %s", item)
+            continue
+
+        if user is None or passwd is None:
+            handler.log("error",
+                        "Couldn't retrieve un/pass for {}: {} {} {} {}".format(
+                            item['channel'], item['data'], user, passwd,
+                            check_type))
+            continue
+
+        CheckTimer(handler, user, passwd, check_type, priority)
+        #check_and_process_mail(handler, user, passwd, priority)
+
+
+if __name__ == "__main__":
+    main()

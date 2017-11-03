@@ -1,0 +1,737 @@
+#!/usr/bin/python
+#
+# You should run the non-_nowrap wrapper of this script.
+#
+
+import argparse
+import datetime
+import json
+import os
+import os.path
+import redbeat
+import signal
+import sh
+import shutil
+import sys
+import tempfile
+import time
+import threading
+import traceback
+
+
+# Defaults for __main__
+MAX_TRIES = 5
+DEFAULT_QUEUE = "default"
+SLEEP_TIME = 15
+
+FROZEN_SLEEP_TIME_S = 1
+
+SUSTAINED_BAD_PROXY_THRESHOLD = 50
+
+# Global for indicating that we should exit when we're running as __main__
+exiting = False   # pylint: disable=C0103
+
+LOG_DIR = "/cesr/tw/logs/queue_logs"
+
+###############################################################################
+
+# We throw out this checkpoint as soon as the first page loads. Just FYI.
+CHECKPOINT_INITIAL_LOAD = 10
+
+# Any final checkpoint < than this threshold will possibly free the iid
+# regardless of return value.
+CHECKPOINT_CLEAR_THRESHOLD = 1000
+
+# These codes have their identities freed. MUST NOT OVERLAP WITH AUTO-REQUEUE.
+# 15/02/03 - Added 33. Should ok to reuse if we didn't use username/password.
+# 15/11/23 - Added 57. Recaptcha check happens before fill.
+# 16/05/26 - Added 95. Human said that it required a payment instrument.
+RET_CODES_CLEAR_TO_FREE = set([5, 13, 14, 16, 30, 31, 33, 54, 57, 90, 95, 96])
+
+# These codes have registrations added of type "unconfirmed"
+RET_CODES_GOOD_REG      = set([0, 10])
+
+# These codes have registrations added of type "possible"
+RET_CODES_POSSIBLE_REG  = set([32, 40, 61, 62, 70, 71, 72, 73, 80])
+
+# These codes *DO NOT* have registrations added. It should be a superset of
+#   RET_CODES_CLEAR_TO_FREE.
+RET_CODES_NO_REG        = set([5, 13, 14, 16, 30, 31, 33,
+                               50, 51, 52, 53, 54, 57,
+                               90, 95, 96])
+
+# These throw an error when they happen.
+# Remove 61 on 150211 so we could run a bunch.
+RET_CODES_ERROR_ON_RECV = set([1, 5, 15, 62, 66, 123, 134])
+
+# Auto-requeue these codes. MUST NOT OVERLAP WITH CLEAR_TO_FREE
+RET_CODES_AUTO_REQUEUE  = set([40, 50, 51, 52, 55, 56, 60, 61, 62, 66, 67, 68,
+                               69, 70, 71, 72, 73, 96, 123, 124, 139, -11])
+
+# These codes should 'fail' after they've been requeued. SUBSET OF AUTO_REQUEUE
+RET_CODES_FAIL_AFTER_RETRY  = set([40, 50, 51, 52, 55, 56, 60, 61, 62, 66, 67,
+                                   68, 69, 123, 124, 139, -11])
+
+# Mark these error codes as failures, and don't remove them from the queue.
+#     (unknown errors are always marked as failures)
+RET_CODES_MARK_FAIL     = set([110])
+
+# How many times to something can be queued before it fails.
+RETRY_MAX               = 1
+
+# How long to let the process run (SIG_TERM)
+TIMEOUT_TERM            = "8m"
+# How long to let the process run (SIG_KILL)
+TIMEOUT_KILL            = "8.1m"
+
+# How long to let the process run (SIG_TERM)
+MANUAL_TIMEOUT_TERM            = "60m"
+# How long to let the process run (SIG_KILL)
+MANUAL_TIMEOUT_KILL            = "61m"
+
+# Where is the main tripwire root directory?
+TRIPWIRE_ROOT           = "/cesr/tw"
+
+# Working directory for crawler
+TW_CRAWL_DIR            = os.environ.get("TW_CRAWL_DIR",
+                                         TRIPWIRE_ROOT + "/casperjs/iframe")
+
+# Initial script name for crawler
+TW_FILE_NAME            = os.environ.get("TW_FILE_NAME",
+                                         "process.js")
+
+# Channel to announce registration attempts to
+CHANNEL_ID_RET_STATUS   = "tw:event:registration_attempt_status"
+
+# Channel to listen for control messages on
+CHANNEL_Q_CONTROL_ALL   = "tw:event:queue_control"
+CHANNEL_Q_CONTROL_LOCAL_PREFIX = "tw:event:local_queue_control:"
+
+# What casperjs binary to use
+CASPERJS_BIN            = "casperjs"
+
+# What flags can the crawler set?
+VALID_FLAGS             = {"field_disappeared"}
+
+# Local imports
+MY_DIR                  = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(MY_DIR)
+import common_utils as c_utils
+import common_logging
+
+OUTDIR_BASE             = c_utils.TRIPWIRE_ROOT + "/deployed/regfills"
+
+# Time to sleep (in seconds) when we detect a bad proxy.
+BAD_PROXY_SLEEP_TIME    = 30
+
+
+twlog = None  # pylint: disable=C0103
+
+###############################################################################
+
+
+def debug_msg(job, *args):
+    msg = ("{}/{}/{}: ".format(job['gid'], job['url'], job['try']) +
+           " ".join(str(x) for x in args))
+    twlog.debug(msg)
+
+
+def freeze_if_frozen(flags):
+    if flags.frozen:
+        twlog.info("Frozen, so sleeping until we're not frozen anymore.")
+    while flags.frozen:
+        time.sleep(FROZEN_SLEEP_TIME_S)
+
+
+def save_metadata(job, outfile):
+    flat_job = {}
+    for key, val in job.iteritems():
+        if isinstance(val, object):
+            val = str(val)
+        flat_job[key] = val
+
+    with open(outfile, 'w') as fp:
+        json.dump(flat_job, fp)
+
+
+def get_output_dir(job):
+    # old version
+    #datestamp = time.strftime("%y%m%d")
+    #out_dir = os.path.join(
+    #    OUTDIR_BASE, datestamp, job['version'], str(job['gid']))
+
+    str_gid = "{:08d}".format(job['gid'])
+    out_dir = os.path.join(OUTDIR_BASE,
+                           str_gid[:2],
+                           str_gid[2:4],
+                           str_gid[4:6],
+                           str_gid[6:])
+    return os.path.realpath(os.path.abspath(out_dir))
+
+
+def process_update(job, msgs, flags, update):
+    #debug_msg(job, "Processing update from child: ", update.strip())
+    parts = update.strip().split(" ", 1)
+    if parts[0] == "status_update":
+        msgs["last_status"] = parts[1]
+        twlog.info("Status update from {}: {}".format(
+            job['url'], msgs["last_status"]))
+    elif parts[0] == "checkpoint":
+        try:
+            msgs["most_recent_checkpoint"] = int(parts[1])
+            debug_msg(job, "Received checkpoint", parts[1])
+        except ValueError:
+            twlog.error("Invalid checkpoint value:", parts[1])
+    elif parts[0] == "error":
+        twlog.warn(
+            "Received error from {}: {}".format(job['gid'], parts[1]))
+    elif parts[0] == "warn":
+        twlog.info(
+            "Received warning from {}: {}".format(job['gid'], parts[1]))
+    elif parts[0] == "flagset":
+        flag, value = parts[1].split(" ", 1)
+        if flag in VALID_FLAGS:
+            flags[flag] = value
+            twlog.info(
+                "Received flagset {} = {}".format(flag, value))
+        else:
+            twlog.error(
+                "Received unknown flagset {} = {}".format(flag, value))
+    else:
+        twlog.warn(
+            "Received unknown message from {}: {}".format(
+                job['gid'], update.strip()))
+
+
+class SustainedBadProxyException(Exception):
+    pass
+
+
+def run_job(db, job, flags, binary, q_args):    # pylint: disable=R0912,R0915
+    """Runs tripwire on the provided info."""
+
+    try:
+        twlog.info("Processing qid:{} gid:{} url:{}".format(
+            job['qid'], job['gid'], job['url']))
+
+        # If we've had poor proxy performance, try to wait it out. Otherwise,
+        # die.
+        bad_query_count = 0
+        while db.get_proxy_history():
+            bad_query_count += 1
+            twlog.info(
+                "Detected poor or unknown proxy performance. Sleeping.")
+            time.sleep(BAD_PROXY_SLEEP_TIME)
+
+            if bad_query_count >= SUSTAINED_BAD_PROXY_THRESHOLD:
+                twlog.error(
+                    "Proxies have been bad for {} consecutive checks.".format(
+                        bad_query_count))
+                db.rollback()
+                raise SustainedBadProxyException()
+
+        freeze_if_frozen(flags)
+
+        # Make the shared output directory before we do anything that we can't
+        # get out of easily.
+        out_dir = get_output_dir(job)
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+
+        # Make a temp dir that we can store the web cache to (then nuke later).
+        cache_dir = tempfile.mkdtemp()
+
+        # Save away job info just in case.
+        save_metadata(job, os.path.join(out_dir, "meta.json"))
+
+        # Create the crawler_flags object now, since it's cheap and easy now.
+        # TODO : Do something with these results
+        crawler_flags = {}
+
+        # Get us some sweet sweet identity, and then commit it, quick-like.
+        iid = db.get_iid(
+            job['id_group'], job['id_type'], job['did'], job['gid'])
+        debug_msg(job, "Selected iid", iid)
+
+        freeze_if_frozen(flags)
+        db.commit()
+
+        # If we fail during this time, we're safe to free that iid.
+        try:
+            # Make sure we really got the identity
+            db.verify_iid(iid, "run_site")
+
+            # Gather arguments
+            conf_file = db.get_conf_filename(iid)
+            proxy_args = db.get_proxy_args(job['id_type'])
+            strategy_args = db.get_strategy_args(job['sid'])
+
+            # File and path preparation
+            #pathsafe_url = job['url'].replace("/", "-")
+            out_file = os.path.join(out_dir, "output.out")
+
+            # We can just skip it if it's already happened for some reason. It
+            # shouldn't though.
+            if os.path.exists(out_file):
+                twlog.error("Found old output. Skipping {}".format(job['gid']))
+                return ("fail", False)
+
+            # Last minute commit (unneeded, but releases locks)
+            freeze_if_frozen(flags)
+            db.commit()
+
+            # Assemble arguments
+            # Arguments for timeout
+            if q_args.manual:
+                args = ["-k", MANUAL_TIMEOUT_KILL, MANUAL_TIMEOUT_TERM, binary]
+            else:
+                args = ["-k", TIMEOUT_KILL, TIMEOUT_TERM, binary]
+            # Arguments for CasperJS
+            args += proxy_args + ["--ignore-ssl-errors=true",
+                                  "--ssl-protocol=any",
+                                  "--local-storage-path=" + cache_dir,
+                                  ]
+            # Arguments for Tripwire
+            args += [TW_FILE_NAME,
+                     "--url=http://" + job['url'],
+                     "--file_prefix=capture",
+                     "--output_directory=" + out_dir,
+                     "--identity_config=" + conf_file] + strategy_args
+
+        except:
+            debug_msg(job, "Rolling back in run_job due to exception")
+            freeze_if_frozen(flags)
+            db.rollback()
+            db.free_identity_if_new(iid)
+            freeze_if_frozen(flags)
+            db.commit()
+            raise
+
+        # Last chance to freeze before we jump into it
+        freeze_if_frozen(flags)
+
+        debug_msg(job, "Running binary")
+        msgs = {}
+        with c_utils.temp_wd(TW_CRAWL_DIR):
+            with open(out_file, 'a') as f:
+                now = datetime.datetime.now()
+                datestamp = now.strftime("%y/%m/%d %H:%M:%S")
+                f.write("Starting at {}".format(datestamp))
+
+            try:
+                for update in sh.timeout(args, _out=out_file, _iter="err"):
+                    process_update(job, msgs, crawler_flags, update)
+
+            except sh.ErrorReturnCode as e:
+                ret_status = e.exit_code
+            else:
+                ret_status = 0
+
+            with open(out_file, 'a') as f:
+                now = datetime.datetime.now()
+                datestamp = now.strftime("%y/%m/%d %H:%M:%S")
+                f.write("Done at {}".format(datestamp))
+
+        # Log an error on unknown return codes...
+        error_name = db.get_error_name_from_no(ret_status)
+        if not error_name:
+            twlog.error("Unknown exit status: (g{}, q{}, ec{})".format(
+                job['gid'], job['qid'], ret_status))
+
+        freeze_if_frozen(flags)
+        # Tell the world what happened
+        twlog.publish(CHANNEL_ID_RET_STATUS, "{},{},{},{}".format(
+            ret_status, iid, job['gid'], job['url']))
+        twlog.info("g{} q{} v{} resulted in {} ({}). Details at {} .".format(
+            job['gid'], job['qid'], job['vid'],
+            error_name if error_name else "UNKNOWN_ERROR",
+            ret_status, out_file))
+
+        freeze_if_frozen(flags)
+        rid = None
+        # Free the identity if we can. Otherwise, make sure it's registered.
+        if (ret_status in RET_CODES_CLEAR_TO_FREE or
+                msgs.get(
+                    "most_recent_checkpoint", 0) < CHECKPOINT_CLEAR_THRESHOLD):
+            debug_msg(job, "Identity is OK to be freed.")
+            db.free_identity_if_new(iid)
+        else:
+            debug_msg(job, "Trying to assign identity to url.")
+            db.assign_iid_to_did_if_needed(
+                job['did'], iid, job['id_group'], job['id_type'])
+            db.commit()
+
+            # Insert the appropriate registration if necessary. If we're free
+            # the iid, then there's no way we had a registration.
+            rid = _insert_registration(db, job, iid, ret_status, q_args)
+
+        if crawler_flags:
+            debug_msg(job, "Flags set: {}".format(str(crawler_flags)))
+
+        freeze_if_frozen(flags)
+        # Save the result
+        db.add_status(job['did'], job['vid'], ret_status, iid,
+                      rid, job['sid'], job['gid'], job['qid'],
+                      msgs.get('most_recent_checkpoint', 0),
+                      msgs.get('last_status', None), job['queue'])
+
+        # Commit all of those changes
+        freeze_if_frozen(flags)
+        db.commit()
+
+        # Nuke the cache directory
+        shutil.rmtree(cache_dir)
+
+        errored = False
+
+        # Warn, if appropriate.
+        if ret_status in RET_CODES_ERROR_ON_RECV or not error_name:
+            twlog.error("Received RC of {} on {} (qid: {} / gid: {})".format(
+                ret_status, job['url'], job['qid'], job['gid']))
+            errored = True
+
+        # Find the appropriate outcome, and return accordingly.
+
+        # Some jobs should just fail outright.
+        if not error_name or ret_status in RET_CODES_MARK_FAIL:
+            debug_msg(job, "This job should fail.")
+            return ("fail", errored)
+
+        # Some jobs should be requeued.
+        if ret_status in RET_CODES_AUTO_REQUEUE:
+            if job['try'] < RETRY_MAX:
+                twlog.info("Requeueing {}/{}/{} for retry {}".format(
+                    job['url'], job['version'], iid, job['try'] + 1))
+                return ("requeue", errored)
+            elif ret_status in RET_CODES_FAIL_AFTER_RETRY:
+                twlog.warn("{} failed after {} attempts.".format(
+                    job['url'], RETRY_MAX))
+                debug_msg(job, "Marking as failed.")
+                return ("fail", errored)
+
+        # If anything weird happened with the proxies, requeue anyway.
+        if db.get_proxy_history() and ret_status not in RET_CODES_GOOD_REG:
+            twlog.info(
+                "Requeueing {}/q{}/g{} due to bad proxy for retry {}".format(
+                    job['url'], job['qid'], job['gid'], job['try'] + 1))
+            return ("requeue", errored)
+
+        # Otherwise, things must be fine.
+        return ("complete", errored)
+
+    except Exception as e:
+        print "Emergency variable dump:"
+        for d in dir():
+            if d.startswith("_") or d == "d":
+                continue
+            print "\t- {:10}: {}".format(d, eval(d))
+        sys.stdout.flush()
+        raise
+
+
+def _insert_registration(db, job, iid, ret_status, q_args):
+    """Insert the appropriate registration if necessary."""
+    reg_type = None
+    if ret_status in RET_CODES_GOOD_REG:
+        if q_args.manual:
+            reg_type = "manual"
+        else:
+            reg_type = "unconfirmed"
+    elif ret_status in RET_CODES_POSSIBLE_REG:
+        reg_type = "possible"
+    elif ret_status not in RET_CODES_NO_REG:
+        reg_type = "unknown"
+
+    if reg_type:
+        debug_msg(job, "Adding registration of type", reg_type)
+        return db.add_registration(
+            job['did'], job['vid'], iid, reg_type)
+    twlog.warn(
+        "Didn't add reg, despite not clearing iid. ec{} iid{} gid{} {}".format(
+            ret_status, iid, job['gid'], job['url']))
+    return None
+
+
+def get_args():
+    """Parse arguments."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-q', '--queue', default=DEFAULT_QUEUE,
+                        help="Which queue to serve from.")
+    parser.add_argument('-m', '--max_tries', default=MAX_TRIES, type=int,
+                        help="Only try jobs with at most this many tries.")
+    parser.add_argument('-s', '--sleep_time', default=SLEEP_TIME,
+                        help="How long to sleep between failures.")
+    parser.add_argument('-n', '--num_jobs', default=0, type=int,
+                        help="Max number of jobs to run (default unlimited).")
+    parser.add_argument('-b', '--burst', action='store_true',
+                        help="Quit when the queue is empty.")
+    parser.add_argument('-e', '--quit_on_error', action='store_true',
+                        help="Quit on encountering 'bad' errors (e.g. 61).")
+    parser.add_argument('-i', '--heartbeat_id', type=int, default=None,
+                        help="ID to use for heartbeat")
+
+    parser.add_argument('-x', '--binary', default=CASPERJS_BIN,
+                        help="Binary to execute. Defaults to CASPERJS_BIN")
+
+    parser.add_argument('-p', '--paused', action='store_true',
+                        help="Start paused? (default false).")
+
+    parser.add_argument('-r', '--run_qid', type=int, default=0,
+                        help="Run only this qid.")
+    parser.add_argument('--manual', action='store_true',
+                        help="Indicate that registrations will be manual.")
+    return parser.parse_args()
+
+
+class Flags(object):
+    def __init__(self, paused=False):
+        self.paused = paused
+        self.exiting = False
+        self.frozen = False
+        self.restarting = False
+
+
+def get_queue_control_callback(flags):
+    def process_control(msg):
+        if msg['type'] != "message":
+            return
+
+        if msg['data'] == "pause":
+            twlog.debug("Received pause request")
+            flags.paused = True
+        elif msg['data'] == "unpause":
+            twlog.debug("Received unpause request")
+            flags.paused = False
+        elif msg['data'] == "freeze":
+            twlog.debug("Received freeze request")
+            flags.frozen = True
+        elif msg['data'] == "melt":
+            twlog.debug("Received melt request")
+            flags.frozen = False
+        elif msg['data'] == "exit":
+            twlog.debug("Received exit request")
+            flags.exiting = True
+        elif msg['data'] == "restart":
+            twlog.debug("Received restart request")
+            flags.exiting = True
+            flags.restarting = True
+        elif msg['data'] == "hard_exit":
+            twlog.info("Hard exit requested (DOES NOT FIX QUEUE)")
+            sys.exit(88)
+        else:
+            twlog.debug("Received unknown request: {}".format(msg['data']))
+    return process_control
+
+
+def start_control_thread(db, flags, node_id=None):
+    # Ugly hack for getting a pubsub object.
+    ps = db._redis.pubsub()  # pylint:disable=W0212
+    q_control_callback = get_queue_control_callback(flags)
+    channel_map = {
+        CHANNEL_Q_CONTROL_ALL: q_control_callback,
+    }
+
+    if node_id is not None:
+        my_channel = CHANNEL_Q_CONTROL_LOCAL_PREFIX + str(node_id)
+        channel_map[my_channel] = q_control_callback
+
+    ps.subscribe(**channel_map)  # pylint:disable=W0142
+    control_thread = PubSubControlThread(ps, 0.1)
+    control_thread.start()
+    return (ps, control_thread)
+
+
+class PubSubControlThread(threading.Thread):
+    def __init__(self, ps, sleep_time, *args, **kwargs):
+        super(PubSubControlThread, self).__init__(*args, **kwargs)
+        self._running = False
+        self.daemon = True
+        self.pubsub = ps
+        self.sleep_time = sleep_time
+
+    def run(self):
+        if self._running:
+            return
+        self._running = True
+        while self._running and self.pubsub.subscribed:
+            self.pubsub.get_message(ignore_subscribe_messages=True)
+            time.sleep(self.sleep_time)
+
+    def stop(self):
+        self._running = False
+        self.join()
+
+
+def stop_control_thread(ct):
+    ps, control_thread = ct
+    control_thread.stop()
+    ps.unsubscribe()
+
+
+def pause_if_paused(flags, rb):
+    if flags.paused:
+        twlog.debug("Paused, so sleeping")
+        checkpoint(rb, "paused")
+        while flags.paused:
+            time.sleep(FROZEN_SLEEP_TIME_S)
+        checkpoint(rb, "unpaused")
+
+
+def checkpoint(rb, *args):
+    if rb:
+        rb.set_data("{}/{}".format(
+            os.getpid(), " ".join([str(x) for x in args])))
+
+
+def claim_and_run_job(db, args, flags, rb):
+    # Pause or freeze if needed
+    pause_if_paused(flags, rb)
+    freeze_if_frozen(flags)
+
+    checkpoint(rb, "claiming")
+
+    # Claim the appropriate job
+    if args.run_qid:
+        twlog.debug("Claiming QID", args.run_qid)
+        job = db.claim_job_by_qid(args.run_qid)
+    else:
+        twlog.debug("Trying to claim job in", args.queue)
+        job = db.claim_and_retrieve_job(args.queue, args.max_tries)
+
+    # Commit that we've claimed it.
+    db.commit()
+
+    # If we didn't get a job, either quit, or loop back
+    if not job:
+        if args.burst:
+            return True
+        twlog.debug("No job to claim.")
+        checkpoint(rb, "idle")
+        time.sleep(args.sleep_time)
+        return False
+
+    checkpoint(rb, "claimed", job['qid'])
+
+    freeze_if_frozen(flags)
+
+    debug_msg(job, "Processing queue item {}".format(job['qid']))
+    try:
+        checkpoint(rb, "running", job['qid'])
+        result, errored = run_job(db, job, flags, args.binary, args)
+    except Exception as e:  # pylint: disable=W0703
+        # Log the error appropriately.
+        twlog.error(
+            "Exception in q{}/{}: {}".format(job['qid'], job['url'], e))
+        traceback.print_exc(file=sys.stdout)
+
+        freeze_if_frozen(flags)
+
+        # Rollback and bail
+        db.rollback()
+        result = "fail"
+        flags.exiting = True
+        errored = True
+
+        checkpoint(rb, "excepted", job['qid'])
+
+        # Force everyone else to freeze.
+        twlog.publish(CHANNEL_Q_CONTROL_ALL, "pause")
+
+    freeze_if_frozen(flags)
+    if result == "complete":
+        db.complete_job_by_qid(job['qid'])
+    if result == "fail":
+        db.fail_job_by_qid(job['qid'])
+    if result == "requeue":
+        db.requeue(job['qid'])
+
+    freeze_if_frozen(flags)
+    db.commit()
+
+    if (errored and args.quit_on_error) or args.run_qid:
+        return True
+
+    return False
+
+
+def serve_forever(args, flags):
+    """Get jobs, and process them indefinitely (or until interrupted)."""
+    db = c_utils.TripwireDB(twlog)
+
+    pid = os.getpid()
+
+    rb = None
+    if args.heartbeat_id is not None:
+        rb = redbeat.start_redbeat(
+            "run_queue_{}".format(args.heartbeat_id), "{}/init".format(pid))
+
+    (con_width, _) = c_utils.get_terminal_size()
+    twlog.green("Starting to serve queue.")
+    twlog.green("*" * (con_width - 28))
+
+    control_thread = start_control_thread(db, flags, args.heartbeat_id)
+
+    num_jobs = 0
+    while not flags.exiting:
+        if args.num_jobs and num_jobs >= args.num_jobs:
+            twlog.debug("Quitting after", num_jobs,
+                        "jobs" if num_jobs > 1 else "job")
+            break
+
+        if claim_and_run_job(db, args, flags, rb):
+            break
+
+        num_jobs += 1
+
+        (con_width, _) = c_utils.get_terminal_size()
+        twlog.magenta("=" * (con_width - 24))
+
+    (con_width, _) = c_utils.get_terminal_size()
+    twlog.debug("Done. " + ("#" * (con_width - 34)))
+
+    checkpoint(rb, "done")
+
+    # Release our control connection
+    stop_control_thread(control_thread)
+
+    if flags.restarting:
+        return 100
+
+
+def get_signal_handler(flags):
+    def signal_handler(signum, _):
+
+        if not flags.exiting:
+            twlog.info("Soft exit requested")
+            flags.exiting = True
+        else:
+            twlog.info("Hard exit requested (DOES NOT FIX QUEUE)", signum)
+            sys.exit(1)
+    return signal_handler
+
+
+def get_logger():
+    now = datetime.datetime.now()
+    datestamp = now.strftime("%y%m%d-%H%M%S")
+    pid = os.getpid()
+    log_filename = os.path.join(LOG_DIR, "{}-{}.log".format(datestamp, pid))
+
+    file_stream = open(log_filename, 'a')
+    tee_stream = common_logging.TeeStream(sys.stdout, file_stream)
+    logger = common_logging.Logger(tee_stream)
+    return logger
+
+
+def main():
+    global twlog  # pylint: disable=W0603
+
+    twlog = get_logger()
+
+    args = get_args()
+    flags = Flags(args.paused)
+    signal.signal(signal.SIGINT, get_signal_handler(flags))
+    return serve_forever(args, flags)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+# This file contains patterns that are blacklisted when queuing.  Each line in
+# the file is considered separately, and is evaluated as a python RE.
+google
+microsoft
+apple
+facebook
+yahoo
+tumblr
+blogspot
+blogger
+youtube
+gmail

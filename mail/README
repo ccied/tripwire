@@ -1,0 +1,7 @@
+This directory used to be totally fractured from the rest of the tripwire file
+tree. As a result, there's still some of duplication.
+
+It's not safe to blindly remove duplicate entries-- ensure that it's not still
+in use before remoing it (although the mailserver is the only
+system at risk of using stuff from this directory).
+

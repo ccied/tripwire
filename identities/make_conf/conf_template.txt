@@ -1,0 +1,36 @@
+//
+// IID: $iid
+//
+exports.fields = {
+    // Specifics. Ordered list of preference
+    month: $month,
+    day: $day,
+    year: $year,
+    dob: $dob,
+    username: $username,
+    email: $email,
+    firstname: $firstname,
+    lastname: $lastname,
+    name: $fullname,
+    password: $password,
+    phone: $phone,
+    areacode: $areacode,
+    sex: $sex,
+    country: ["United States of America", "USA", "United States"],
+    zip: $zip,
+    state: $state,
+    city: $city,
+    age: $age,
+    address: $address,
+    answer: ["Phoenix", "Ranger"],
+
+    // Defaults
+    checkboxes: {method: "check"},      // Check all checkboxes
+    selects: {method: "random"},        // Randomly choose select inputs
+    radiobuttons: {method: "random"},   // Randomly choose radio selections
+    // Other OK methods: "first", "nth" (needs 'nth' attribute)
+};
+
+exports.requiredSet = {email: true, password: true}; // Set of required fields
+
+

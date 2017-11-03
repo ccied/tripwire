@@ -1,0 +1,23 @@
+#!/usr/bin/python
+
+import os, sys, redis
+
+CHANNEL_PREFIX = os.env.get("TW_LOG_PREFIX", "tw:log:")
+
+def usage():
+    sys.stderr.write("Error: Arguments required.\n"
+                     "Usage: " + sys.argv[0] + " CHANNEL MESSAGE\n")
+    sys.exit(1)
+
+def main():
+    if len(sys.argv) < 3:
+        usage()
+        
+    r = redis.Redis()
+    r.publish(CHANNEL_PREFIX + sys.argv[1], " ".join(sys.argv[2:]))
+
+    return 0
+
+if __name__ == "__main__":
+    main()
+

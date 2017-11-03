@@ -1,0 +1,82 @@
+#!/usr/bin/python
+"""Logs all indicated published messages in redis to a file or stdout."""
+
+import sys
+import os
+import argparse
+import redbeat
+import socket
+import signal
+
+from PubListener import PubListener
+
+client = None
+
+
+def get_signal_name(sig):
+    if sig == 15:
+        return "SIGTERM"
+    elif sig == 9:
+        return "SIGKILL"
+    elif sig == 2:
+        return "SIGINT"
+    else:
+        return "Signal " + str(sig)
+
+
+def signal_handler(sig, frame):
+    client.kill(get_signal_name(sig))
+    sys.exit(0)
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-o', '--outfile', metavar="FILENAME",
+                        help="Log output to file (defaults to stdout)",
+                        type=argparse.FileType('a', bufsize=1),
+                        default=sys.stdout)
+    parser.add_argument('-n', '--name', default=None,
+                        help="Name this logger (for easier control))")
+    parser.add_argument('-b', '--background', action="store_true",
+                        help="Run in background (requires -o)")
+    parser.add_argument('-j', '--justmessages', action="store_true",
+                        help="Only show messages (not subscribes, etc.)")
+    parser.add_argument('-T', '--notime', action="store_true",
+                        help="Don't output timestamp")
+    parser.add_argument('patterns', metavar='PATTERN', nargs='+',
+                        help='One or more patterns to watch for')
+    return parser.parse_args()
+
+
+def main():
+    global client
+
+    args = get_args()
+
+    if args.background and args.outfile == sys.stdout:
+        sys.stderr.write("ERROR: Option -b requires -o\n")
+        sys.exit(1)
+
+    # TODO - daemonize properly...
+    if args.background:
+        pid = os.fork()
+        if not pid == 0:
+            sys.exit()
+
+    if args.name:
+        redbeat.start_redbeat(
+            "{}/{}".format(args.name, socket.gethostname().split(".", 1)[0]),
+            "{}".format(os.getpid()))
+
+    client = PubListener(args.patterns, args.outfile, args.name,
+                         args.justmessages, args.notime)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # This is technically threadable, but it doesn't buy us much here.
+    client.run()
+
+
+if __name__ == "__main__":
+    main()

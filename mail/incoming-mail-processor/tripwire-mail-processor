@@ -1,0 +1,90 @@
+#!/usr/bin/python
+"""This service runs and services mail out of the unprocessed_messages table.
+
+Running as a separate service permits us to allow messages to come in before
+we've finished registering, which happens on occasion.
+
+This system verifies that that identity isn't in active use before we try to
+click on anything.
+
+"""
+
+HEARTBEAT_NAME = "mailq-processor"
+HANDLE_MAIL_PATH = "/cesr/tw/mail/mailhandler"
+SLEEP_BETWEEN_CHECKS_S = 10.0
+
+import logging
+import os
+import redbeat
+import socket
+import sys
+import time
+import traceback
+
+sys.path.insert(0, HANDLE_MAIL_PATH)
+import handle_email
+
+
+def process_msgs(handler):
+    messages = handler.get_queued_messages()
+
+    if messages:
+        handler.log("debug",
+                    "process_msgs processing {} messages".format(
+                        len(messages)))
+
+    for msg in messages:
+        try:
+            handler.accept_mail(
+                msg['message'],
+                backup=False,
+                message_path=msg['message_path'])
+            handler.dequeue_message(msg['umid'])
+            handler.log("info",
+                        "Finished processing umid {}".format(msg['umid']))
+        except Exception as e:  # pylint: disable=broad-except
+            handler.log("error",
+                        "process_msgs failed on queued msg {} with {}.".format(
+                            msg['umid'], repr(e)))
+            handler.log("warning", traceback.format_exc())
+            handler.disabled_queued_message(msg['umid'])
+        time.sleep(1)
+        handler.commit()
+    handler.commit()
+
+    if messages:
+        handler.log("debug",
+                    "process_msgs done processing messages")
+
+
+def get_r_handler(mail_handler):
+    def process_redis_msg(msg):
+        # Ignore the input...
+        process_msgs(mail_handler)
+
+
+def main():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+        datefmt='%m-%d %H:%M')
+
+    redbeat.start_redbeat(
+        HEARTBEAT_NAME, "{}/{}".format(socket.gethostname(), os.getpid()))
+
+    handler = handle_email.get_handler()
+
+    handler.log("info",
+                "mail-processor starting mail processing")
+
+    try:
+        while True:
+            time.sleep(SLEEP_BETWEEN_CHECKS_S)
+            handler.log("debug", "mail-processor wake")
+            process_msgs(handler)
+    except Exception as e:  # pylint: disable=broad-except
+        handler.log("error",
+                    "mail-processor caught exception of {}. Dying.".format(e))
+
+if __name__ == "__main__":
+    main()

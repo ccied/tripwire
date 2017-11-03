@@ -1,0 +1,304 @@
+#!/usr/bin/python
+
+import Tkinter
+from PIL import Image, ImageTk
+import Queue
+import threading
+import time
+
+import asyncore
+import socket
+import sys, os, select
+import subprocess
+#import termios, atexit
+
+class PromptHandler(asyncore.dispatcher_with_send):
+    def __init__(self, sock, gui):
+        asyncore.dispatcher_with_send.__init__(self, sock)
+        self.gui = gui
+
+    def handle_read(self):
+        data = self.recv(8192)
+        if data:
+            parts = data.split(' ', 1)
+            #print repr(parts)
+
+            self.send(self.gui.query(parts[0], parts[1]))
+
+class PromptServer(asyncore.dispatcher):
+
+    def __init__(self, host, port, gui):
+        asyncore.dispatcher.__init__(self)
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        try:
+            self.bind((host, port))
+        except:
+            raise
+        self.listen(5)
+        #atexit.register(toggle_echo, sys.stdin.fileno(), True)
+        self.gui = gui
+
+    def handle_accept(self):
+        pair = self.accept()
+        if pair is not None:
+            sock, addr = pair
+            #print 'Incoming connection from %s' % repr(addr)
+            handler = PromptHandler(sock, self.gui)
+
+class ImagePicker:
+    """Nice wrapper class for the GUI thingy"""
+
+    accumulated = ''
+
+    incoming = Queue.Queue(1)
+    outgoing = Queue.Queue(1)
+
+    def handleCmd(self, cmd):
+        if cmd == "quit" or cmd == "exit":
+            #self.root.quit()
+            #self.root.destroy()
+            raise SystemExit()
+        self.respond(self.accumulated)
+
+    def query(self, path, text):
+        try:
+            self.outgoing.get_nowait()
+        except Queue.Empty:
+            pass
+        self.incoming.put((path, text))
+        return self.outgoing.get()
+
+    def respond(self, response):
+        try:
+            self.outgoing.get_nowait()
+        except Queue.Empty:
+            pass
+        self.outgoing.put(response)
+        self.accumulated = ''
+        self.clearContent()
+        #self.loadText('(Awaiting Request)')
+        #self.loadImage('spacer.png')
+        #self.loadLongText('')
+
+    def catchInputs(self):
+        try:
+            path, text = self.incoming.get_nowait()
+
+            try:
+                self.outgoing.get_nowait()
+            except Queue.Empty:
+                pass
+
+            if path == "TEXT":
+                path = None
+            self.loadContent(path, text)
+
+        except Queue.Empty:
+            pass
+
+        self.root.after(100, self.catchInputs)
+
+
+    def handle_key(self, event):
+        #print "pressed", repr(event.char)
+
+        if event.char == '\r':
+            #print "User: " + self.accumulated
+            self.handleCmd(self.accumulated)
+            self.accumulated = ''
+        elif event.char == '\x03':
+            self.accumulated = ''
+        elif event.char == '\x7f':
+            self.accumulated = self.accumulated[:-1]
+        elif event.char == '\x08':
+            self.accumulated = self.accumulated[:-1]
+        else:
+            self.accumulated += event.char
+
+        self.loadText(self.accumulated, self.tr)
+
+    def handle_click(self, event):
+        self.root.focus_set()
+        #print "clicked at", event.x, event.y
+
+    def clearContent(self, target=None):
+        if target == None:
+            target = self.imageframe
+        target.configure(state=Tkinter.NORMAL, bg="#000")
+        #target.configure(state=Tkinter.NORMAL, bg="#aaa")
+        target.delete(1.0, Tkinter.END)
+        target.configure(state=Tkinter.DISABLED)
+
+    def loadContent(self, path, text, target=None):#, maxsize=(1680,1000)):
+        if target == None:
+            target = self.imageframe
+        # TODO Exception handling
+
+        target.configure(state=Tkinter.NORMAL, bg="#faa")
+        target.delete(1.0, Tkinter.END)
+
+        text = text.replace("\\n", "\n")
+        text = text.replace("\\t", "\t")
+
+        if text is not None:
+            target.insert(Tkinter.END, text + "\n\n")
+
+        if path is not None:
+            try:
+                im = Image.open(path)
+                background_image = ImageTk.PhotoImage(im)
+                target.image = im
+                target.bgimage = background_image
+                target.image_create(Tkinter.INSERT, image=background_image)
+            except IOError:
+                print "ERROR: Unable to find image " + path
+
+
+        target.configure(state=Tkinter.DISABLED)
+
+    def loadImage(self, path, target=None):#, maxsize=(1680,1000)):
+        if target == None:
+            target = self.imageframe
+        # TODO Exception handling
+
+        if path is not None:
+            try:
+                im = Image.open(path)
+            except IOError:
+                print "ERROR: Unable to find image " + path
+                return
+
+            #im.thumbnail(maxsize)
+            background_image = ImageTk.PhotoImage(im)
+            #target.configure(image=background_image)
+
+            target.configure(state=Tkinter.NORMAL)
+            target.delete(1.0, Tkinter.END)
+            target.image_create(Tkinter.INSERT, image=background_image)
+            target.configure(state=Tkinter.DISABLED)
+
+            target.image = im
+            target.bgimage = background_image
+        else:
+            target.configure(state=Tkinter.NORMAL)
+            target.delete(1.0, Tkinter.END)
+            target.configure(state=Tkinter.DISABLED)
+
+    def loadLongText(self, text, target=None):
+        if target == None:
+            target = self.imageframe
+        target.configure(state=Tkinter.NORMAL)
+        target.delete(1.0, Tkinter.END)
+
+        text = text.replace("\\n", "\n")
+        text = text.replace("\\t", "\t")
+        #print parts
+        #for line in range(len(parts)):
+        #    target.insert("%d.end" % (line + 1), parts[line])
+        target.insert(Tkinter.END, text)
+
+        target.configure(state=Tkinter.DISABLED)
+
+    def loadText(self, newText, target=None):
+        if target == None:
+            target = self.tl
+        target.configure(text=newText)
+
+    def __init__(self):
+        self.root = Tkinter.Tk(  )
+        self.root.bind("<Key>", self.handle_key)
+        self.root.bind("<Button-1>", self.handle_click)
+        self.root.title("Tripwire Interactive")
+
+        #self.tl = Tkinter.Label(self.root,
+        #                        text='(Awaiting Request)', borderwidth=1)
+        self.tl = Tkinter.Label(self.root, borderwidth=1)
+        self.tl.grid(row=0, column=0, sticky=Tkinter.W, padx=5, pady=5)
+        self.tr = Tkinter.Label(self.root, text='', borderwidth=1, fg="red")
+        self.tr.grid(columnspan=2, row=0, column=1,
+                     sticky=Tkinter.E, padx=5, pady=5)
+
+        self.bottom = Tkinter.Frame(self.root,
+                                    borderwidth=1)#, width=800, height=800)
+        self.bottom.grid_rowconfigure(1, weight=1)
+        self.bottom.grid_columnconfigure(0, weight=1)
+        self.bottom.grid(row=1, columnspan=3,
+                         sticky=Tkinter.N+Tkinter.S+Tkinter.E+Tkinter.W)
+
+        ########
+
+        self.xscrollbar = Tkinter.Scrollbar(self.root,
+                                            orient=Tkinter.HORIZONTAL)
+        self.xscrollbar.grid(columnspan=3, row=2, column=0,
+                             sticky=Tkinter.E+Tkinter.W)
+
+        self.yscrollbar = Tkinter.Scrollbar(self.root)
+        self.yscrollbar.grid(row=1, column=3, sticky=Tkinter.N+Tkinter.S)
+
+        self.imageframe = Tkinter.Text(self.bottom, borderwidth=1, bd=2,
+                relief=Tkinter.RAISED, bg="#000", width=200, height=50,
+                xscrollcommand=self.xscrollbar.set,
+                yscrollcommand=self.yscrollbar.set,
+                state=Tkinter.DISABLED, font=("Helvetica", 16),
+                padx=10, pady=10)
+        #self.imageframe = Tkinter.Text(self.bottom, borderwidth=1, bd=2,
+        #        relief=Tkinter.RAISED, bg="#aaa", width=200, height=50,
+        #        xscrollcommand=self.xscrollbar.set,
+        #        yscrollcommand=self.yscrollbar.set,
+        #        state=Tkinter.DISABLED, font=("Helvetica", 16),
+        #        padx=10, pady=10)
+
+        self.imageframe.grid(row=1, column=0, columnspan=1,
+                             sticky=Tkinter.N+Tkinter.S+Tkinter.E+Tkinter.W)
+
+        self.xscrollbar.config(command=self.imageframe.xview)
+        self.yscrollbar.config(command=self.imageframe.yview)
+
+        # Handle window stretching
+        top=self.root.winfo_toplevel()
+        self.root.rowconfigure(1, weight=1)
+        self.root.columnconfigure(0, weight=1)
+
+
+        #self.loadLongText('')
+
+
+
+    def start(self):
+        self.catchInputs()
+        self.root.mainloop(  )
+
+class RequestServer(threading.Thread):
+    def __init__(self, gui):
+        self.gui = gui
+        threading.Thread.__init__(self)
+        self.daemon = True
+
+    def run(self):
+        try:
+            server = PromptServer('localhost', 5080, self.gui)
+        except socket.error as e:
+            code, msg = e
+            sys.stderr.write("ERROR: " + msg + "\n")
+            raise SystemExit()
+
+        asyncore.loop()
+        #try:
+        #    asyncore.loop()
+        #except KeyboardInterrupt:
+        #    sys.exit()
+
+    def kill(self):
+        raise SystemExit()
+
+if __name__ == '__main__':
+    ip = ImagePicker()
+    sv = RequestServer(ip)
+    sv.start()
+    try:
+        ip.start() # Never returns
+    except KeyboardInterrupt:
+        sv.kill()
+    sv.join()
+

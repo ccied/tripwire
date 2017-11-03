@@ -1,0 +1,178 @@
+#!/usr/bin/python
+"""Queues sites for later crawling by Tripwire."""
+
+import argparse
+import os
+import os.path
+import re
+import sys
+
+# Local imports
+MY_DIR            = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(MY_DIR)
+
+import common_utils as c_utils
+import common_logging
+
+twlog = None  #pylint: disable=C0103
+
+
+# Unclear whether or not 'possible' should be included
+DEFAULT_ACCEPTABLE_STATII = [
+    'unconfirmed', 'email-received', 'email-clicked', 'possible']
+
+BLACKLIST_PATTERN_FILE = "/cesr/tw/deployed/url_pattern_blacklist"
+
+
+def regex_string_checker(regexp_str):
+    """A fake type that I can pass to argparse to validate a regex."""
+    regexp = re.compile(regexp_str)
+
+    def get_str(test):
+        """Supposedly converts to string, but raises on invalid input."""
+        if not regexp.search(test):
+            raise argparse.ArgumentTypeError("Invalid version format")
+        return test
+    return get_str
+
+
+def get_blacklist():
+    patterns = []
+    with open(BLACKLIST_PATTERN_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line[0] == '#':
+                continue
+
+            pattern = re.compile(line)
+            patterns.append(pattern)
+    return patterns
+
+
+def get_args():
+    version_re = regex_string_checker("^[a-zA-Z0-9_=-]+$")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-q', '--queue', default='default',
+                        help="Queue to put sites in (default 'default')")
+    parser.add_argument('-B', '--disable_blacklist', action='store_true',
+                        help="Disable URL blacklist checking. Queue all URLs.")
+    parser.add_argument('-f', '--force', action='store_true',
+                        help=("Force the queuing of these sites, regardless "
+                              "of previous registration status"))
+    parser.add_argument('-s', '--skip_status', action='append',
+                        help=("Use this status as an acceptable pre-existing "
+                              "registration. If found, queueing will be "
+                              "skipped. (Can be repeated.)"))
+    parser.add_argument('VERSION', type=version_re,
+                        help="A string for identitying this run")
+    parser.add_argument('ID_GROUP',
+                        help="What group of identities to pull from")
+    parser.add_argument('ID_TYPE',
+                        help="What type of identities to pull (e.g. 'hard1')")
+    parser.add_argument('STRATEGY',
+                        help="What strategy name to use")
+    parser.add_argument('URL_CSV', type=argparse.FileType(), nargs='+',
+                        help="A file that contains id,url pairs")
+    #parser.add_argument('-b', '--background', action="store_true",
+    #                    help="Run in background (requires -o)")
+    return parser.parse_args()
+
+
+def domain_in_blacklist(blacklist, domain):
+    for pattern in blacklist:
+        if pattern.search(domain):
+            return True
+    return False
+
+
+def queue_urls(
+        url_file, version, id_group, id_type, strategy_name, queue, force,
+        statii, blacklist):
+    lines = url_file.readlines()
+
+    db = c_utils.TripwireDB(twlog)
+
+    sid = db.get_sid_from_name(strategy_name)
+    vid = db.get_vid_from_name(version)
+
+    num_queued = 0
+
+    for line in lines:
+        line = line.strip()
+        parts = line.split(",")
+        alexa = parts[0]    # Now ignored. wtf do we care about alexa anyway.
+        if not alexa:
+            alexa = None
+        domain = parts[1]
+
+        if not line or line[0] == '#':
+            continue
+
+        if domain_in_blacklist(blacklist, domain):
+            continue
+
+        did = db.get_did_from_domain_name(domain)
+
+        num_accounts = db.get_num_accounts_of_type(
+            did, id_type, statii)
+        if num_accounts > 0 and not force:
+            print "{},SKIPPED".format(line)
+
+            # Hackily log the decision
+            db._queries.status.log_decision(
+                did, alexa, queue, sid, id_type, id_group, vid, None,
+                'skipped', os.getpid())
+            db.commit()
+            continue
+
+        qid = db.queue_site(did, vid, id_group, id_type, sid, queue, alexa)
+
+        # Hackily log the decision
+        db._queries.status.log_decision(
+            did, alexa, queue, sid, id_type, id_group, vid, qid,
+            'queued', os.getpid())
+        db.commit()
+
+        print "{},{}".format(line, qid)
+
+        num_queued += 1
+
+    twlog.info("{} sites queued".format(num_queued))
+
+
+def get_logger():
+    #now = datetime.datetime.now()
+    #datestamp = now.strftime("%y%m%d-%H%M%S")
+    #pid = os.getpid()
+    #log_filename = os.path.join(LOG_DIR, "{}-{}.log".format(datestamp, pid))
+
+    #file_stream = open(log_filename, 'a')
+    #tee_stream = common_logging.TeeStream(sys.stdout, file_stream)
+    #logger = common_logging.Logger(tee_stream)
+    logger = common_logging.Logger(sys.stdout)
+    return logger
+
+
+def main():
+    global twlog  # pylint: disable=W0603
+
+    twlog = get_logger()
+    args = get_args()
+
+    if args.disable_blacklist:
+        blacklist = []
+    else:
+        blacklist = get_blacklist()
+
+    for csv in args.URL_CSV:
+        queue_urls(
+            csv, args.VERSION, args.ID_GROUP,
+            args.ID_TYPE, args.STRATEGY, args.queue, args.force,
+            args.skip_status if args.skip_status else DEFAULT_ACCEPTABLE_STATII,
+            blacklist)
+
+
+if __name__ == "__main__":
+    main()
+
